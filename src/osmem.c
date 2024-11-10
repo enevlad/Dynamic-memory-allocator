@@ -90,24 +90,28 @@ void *os_malloc(size_t size)
 	if (head) {
 		// find best fit
 		block = find_block(size);
+		if (block && block->next == NULL && block->status == STATUS_FREE && size > block->size) {
+			void *request = sbrk(size - block->size);
+
+			DIE(request == (void *)-1, "sbrk failed");
+			block->size = size;
+			block->status == STATUS_ALLOC;
+			return (void *)(block + 1);
+		}
 		if (block && block->status == STATUS_FREE) {
 			//split block
 			if (block->size >= size + sizeof(struct block_meta) + ALIGNMENT) {
 				struct block_meta *new = (struct block_meta *)((char *)block + sizeof(struct block_meta) + size);
 
-				new->size = block->size - size - sizeof(struct block_meta);
+				new->size = ALIGN_SIZE(block->size - size - sizeof(struct block_meta));
 				new->status = STATUS_FREE;
-				new->next = NULL;
 				new->prev = block;
-
-				if (block->next)
+				if (block->next) {
 					block->next->prev = new;
+					new->next = block->next;
+				}
 				block->size = size;
 				block->next = new;
-			} else if (size > block->size) {
-				void *request = sbrk(size - block->size);
-
-				block->size = size;
 			}
 			block->status = STATUS_ALLOC;
 			return (void *)(block + 1);

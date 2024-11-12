@@ -230,10 +230,12 @@ void *os_realloc(void *ptr, size_t size)
 		return NULL;
 	size = ALIGN_SIZE(size);
 
+	// truncate the block if size given is smaller than the block size
 	if (block->status == STATUS_ALLOC && size < block->size) {
 		split_block(block, size);
 		return ptr;
 	}
+	// try to extend if it is the last block in the list
 	if (last == block && last->size < size) {
 		void *request = sbrk(size - last->size);
 
@@ -242,6 +244,8 @@ void *os_realloc(void *ptr, size_t size)
 		return (void *)(last + 1);
 	}
 
+	// coalesce block with free blocks after it
+	// if it is not space leave it as it is
 	size_t coalesce_size = block->size;
 
 	while (block->next && block->next->status == STATUS_FREE) {
@@ -250,20 +254,14 @@ void *os_realloc(void *ptr, size_t size)
 		if (block->size >= size + sizeof(struct block_meta) + ALIGNMENT) {
 			split_block(block, size);
 			return ptr;
+		} else if (coalesce_size > size) {
+			return ptr;
 		}
 	}
 	if (coalesce_size == size)
 		return ptr;
-	struct block_meta *re_block = find_block(size);
 
-	if (re_block) {
-		split_block(re_block, size);
-		re_block->status = STATUS_ALLOC;
-		memcpy((void *)(re_block + 1), ptr, copy_of_size);
-		os_free(ptr);
-		return (void *)(re_block + 1);
-	}
-
+	// if all else fails call os_malloc and copy to the new pointer
 	void *new = os_malloc(size);
 
 	if (new) {

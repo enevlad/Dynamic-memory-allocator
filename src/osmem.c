@@ -1,68 +1,48 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <unistd.h>
+#include <string.h>
 #include <sys/mman.h>
 #include "osmem.h"
 #include "block_meta.h"
 
 #define ALIGNMENT 8
 
-#define ALIGN_SIZE(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
+#define ALIGN_SIZE(size) (((size) + (ALIGNMENT-1)) & ~(ALIGNMENT-1))
 
 #define HEAP_SIZE (128 * 1024)
 
 struct block_meta *head;
+struct block_meta *last;
 
 static int is_heap_init;
 
-struct block_meta *give_me_space(struct block_meta *last, size_t size)
-{
-	struct block_meta *old_block, *new_block;
-
-	old_block = sbrk(0);
-	new_block = sbrk(size + sizeof(struct block_meta));
-	DIE(new_block == (void *) -1, "sbrk failed");
-	old_block->size = size;
-	old_block->status = STATUS_ALLOC;
-	old_block->next = NULL;
-	old_block->prev = last;
-	if (last)
-		last->next = old_block;
-	return old_block;
-}
-
 struct block_meta *find_block(size_t size)
 {
-	struct block_meta *block = head;
+	struct block_meta *current = head;
+	struct block_meta *best = NULL;
 
-	while (block && block->next) {
-		if (block->status == STATUS_FREE && block->size >= size)
-			return block;
-		block = block->next;
+	while (current) {
+		if (current->status == STATUS_FREE && current->size >= size) {
+			if (!best || current->size < best->size)
+				best = current;
+		}
+		current = current->next;
 	}
-	return block;
+	return best;
 }
 
 void init_heap(void)
 {
 	if (!is_heap_init) {
 		head = (struct block_meta *)sbrk(HEAP_SIZE);
-		DIE(head == (void *) -1, "sbrk failed");
+		DIE(head == MAP_FAILED, "sbrk failed");
 		head->size = HEAP_SIZE - sizeof(struct block_meta);
 		head->status = STATUS_ALLOC;
 		head->next = NULL;
 		head->prev = NULL;
 		is_heap_init = 1;
 	}
-}
-
-struct block_meta *get_addr_block(void *ptr)
-{
-	char *aux = ptr;
-
-	aux = aux - sizeof(struct block_meta);
-	ptr = aux;
-	return ptr;
 }
 
 void *os_malloc(size_t size)
@@ -87,54 +67,28 @@ void *os_malloc(size_t size)
 		return (void *)(block + 1);
 	}
 
-	if (head) {
-		// find best fit
-		block = find_block(size);
-		if (block && block->next == NULL && block->status == STATUS_FREE && size > block->size) {
-			void *request = sbrk(size - block->size);
+	// find best fit
+	block = find_block(size);
+	if (block) {
+		//split block
+		if (block->size >= size + sizeof(struct block_meta) + ALIGNMENT) {
+			struct block_meta *new = (struct block_meta *)((char *)block + sizeof(struct block_meta) + size);
 
-			DIE(request == (void *)-1, "sbrk failed");
+			new->size = block->size - size - sizeof(struct block_meta);
+			new->status = STATUS_FREE;
+			new->next = NULL;
+			new->prev = block;
+
+			if (block->next)
+				block->next->prev = new;
 			block->size = size;
-			block->status == STATUS_ALLOC;
-			return (void *)(block + 1);
+			block->next = new;
 		}
-		if (block && block->status == STATUS_FREE) {
-			//split block
-			if (block->size >= size + sizeof(struct block_meta) + ALIGNMENT) {
-				struct block_meta *new = (struct block_meta *)((char *)block + sizeof(struct block_meta) + size);
-
-				new->size = ALIGN_SIZE(block->size - size - sizeof(struct block_meta));
-				new->status = STATUS_FREE;
-				new->prev = block;
-				if (block->next) {
-					block->next->prev = new;
-					new->next = block->next;
-				}
-				block->size = size;
-				block->next = new;
-			}
-			block->status = STATUS_ALLOC;
-			return (void *)(block + 1);
-		}
-		block = give_me_space(block, size);
-		if (!block)
-			return NULL;
-	} else {
-		init_heap();
-		block = head;
+		block->status = STATUS_ALLOC;
+		return (void *)(block + 1);
 	}
-	return (void *)(block + 1);
-}
 
-struct block_meta *coalesce_blocks(struct block_meta *block)
-{
-	if (block->next && block->next->status == STATUS_FREE) {
-		block->size += block->next->size + sizeof(struct block_meta);
-		block->next = block->next->next;
-	}
-	if (block->next)
-		block->next->prev = block;
-	return block;
+	return NULL;
 }
 
 void os_free(void *ptr)
@@ -161,11 +115,90 @@ void os_free(void *ptr)
 void *os_calloc(size_t nmemb, size_t size)
 {
 	/* TODO: Implement os_calloc */
-	return NULL;
+	if (nmemb == 0 || size == 0)
+		return NULL;
+	size_t total_size = nmemb * size;
+	size_t page_size = getpagesize();
+	void *ptr;
+
+	total_size = ALIGN_SIZE(total_size);
+
+	if (total_size + sizeof(struct block_meta) < page_size) {
+		ptr = os_malloc(total_size);
+		if (ptr)
+			memset(ptr, 0, total_size);
+	} else {
+		struct block_meta *block = mmap(NULL, total_size + sizeof(struct block_meta),
+										PROT_WRITE | PROT_READ,
+										MAP_PRIVATE | 0x20, -1, 0);
+
+		DIE(block == MAP_FAILED, "mmap failed");
+		block->status = STATUS_MAPPED;
+		block->size = total_size;
+		block->prev = NULL;
+		block->next = NULL;
+		ptr = (void *)(block + 1);
+		memset(ptr, 0, total_size);
+	}
+	return ptr;
 }
 
 void *os_realloc(void *ptr, size_t size)
 {
 	/* TODO: Implement os_realloc */
-	return NULL;
+	if (ptr == NULL)
+		return os_malloc(size);
+	if (size == 0) {
+		os_free(ptr);
+		return NULL;
+	}
+
+	struct block_meta *block = get_addr_block(ptr);
+	size_t copy_of_size = block->size;
+
+	if (block == NULL || block->status == STATUS_FREE)
+		return NULL;
+	size = ALIGN_SIZE(size);
+
+	// truncate the block if size given is smaller than the block size
+	if (block->status == STATUS_ALLOC && size < block->size) {
+		split_block(block, size);
+		return ptr;
+	}
+	// try to extend if it is the last block in the list
+	if (last == block && last->size < size) {
+		void *request = sbrk(size - last->size);
+
+		DIE(request == MAP_FAILED, "sbrk failed");
+		last->size = size;
+		return (void *)(last + 1);
+	}
+
+	// coalesce block with free blocks after it
+	// if it is not space leave it as it is
+	size_t coalesce_size = block->size;
+
+	while (block->next && block->next->status == STATUS_FREE) {
+		coalesce_size += block->next->size + sizeof(struct block_meta);
+		block = coalesce_blocks(block);
+		if (block->size >= size + sizeof(struct block_meta) + ALIGNMENT) {
+			split_block(block, size);
+			return ptr;
+		} else if (coalesce_size > size) {
+			return ptr;
+		}
+	}
+	if (coalesce_size == size)
+		return ptr;
+
+	// if all else fails call os_malloc and copy to the new pointer
+	void *new = os_malloc(size);
+
+	if (new) {
+		if (size < copy_of_size)
+			copy_of_size = size;
+		memcpy(new, ptr, copy_of_size);
+		os_free(ptr);
+	}
+	return new;
 }
